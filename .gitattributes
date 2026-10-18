@@ -1,0 +1,22 @@
+# Git LFS：大文件统一走 LFS，避免仓库本体膨胀
+
+# containerd 二进制 bundle（~45MB）
+backend/data/plugins/bundle/*.tar.gz filter=lfs diff=lfs merge=lfs -text
+
+# ansible-manager 镜像 tar（~300MB）
+backend/data/plugins/bundle/*.tar filter=lfs diff=lfs merge=lfs -text
+
+# 通用大二进制
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.tgz filter=lfs diff=lfs merge=lfs -text
+
+# Python wheel 包（~25MB，LFS 顺带管）
+backend/wheels/*.whl filter=lfs diff=lfs merge=lfs -text
+
+# 文本文件统一换行符
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md  text eol=lf
+*.sh  text eol=lf
+*.json text eol=lf

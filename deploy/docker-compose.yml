@@ -1,0 +1,32 @@
+# 单镜像单端口方案：前端构建产物由后端在 3000 端口一并托管
+# 构建与启动（仓库根目录）：
+#   docker compose -f deploy/docker-compose.yml build
+#   docker compose -f deploy/docker-compose.yml up -d
+# 访问 http://<宿主机IP>:3000 （账号 admin/admin123）
+services:
+  app:
+    build:
+      # 上下文必须在仓库根：镜像内需要同时构建前端与后端
+      context: ..
+      dockerfile: Dockerfile
+    image: ansible-manager:latest
+    container_name: am-app
+    restart: unless-stopped
+    # 单进程约束：任务 worker 与调度器内嵌，禁止多副本
+    deploy:
+      replicas: 1
+    environment:
+      APP_PORT: "3000"
+      STATIC_DIR: /app/static
+      # 生产务请显式配置下列密钥
+      JWT_SECRET: ${JWT_SECRET:-please-change-me}
+      CREDENTIAL_SECRET: ${CREDENTIAL_SECRET:-b0fG9z4C3q7vAmSxK1Lw8uYt2NcRj5HhP0oEi6UdXgM=}
+      DEBUG: "false"
+    volumes:
+      # sqlite 数据与任务产物持久化
+      - app_data:/app/data
+    ports:
+      - "3000:3000"
+
+volumes:
+  app_data:

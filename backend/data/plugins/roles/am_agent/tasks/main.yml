@@ -1,0 +1,11 @@
+# Ansible Manager Agent 子服务安装 role
+# MVP 占位：打通 include_role 链路。
+- name: 回显 am_agent 安装占位
+  ansible.builtin.debug:
+    msg: "am_agent: 在 {{ inventory_hostname }} 上安装 ansible-manager agent（占位实现）"
+
+- name: 确保 /opt/am-agent 目录存在
+  ansible.builtin.file:
+    path: /opt/am-agent
+    state: directory
+    mode: "0755"

@@ -1,0 +1,3 @@
+- name: 回显 am_agent 卸载占位
+  ansible.builtin.debug:
+    msg: "am_agent: 在 {{ inventory_hostname }} 上卸载 ansible-manager agent（占位实现）"

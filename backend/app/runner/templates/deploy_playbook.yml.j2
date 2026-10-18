@@ -1,0 +1,235 @@
+# containerd 部署 playbook 模板
+#   定界符约定：平台注入统一用尖括号定界符（Jinja2 渲染期），双花括号全部保留给 Ansible 运行期。
+#   切勿把 Ansible 运行期变量（item/hc/...）写进尖括号定界符，也勿把平台变量写进双花括号。
+# 画像: ping 预检 → 分发并重命名自带套件 → 启动隔离 containerd(幂等) → pull(重试) → rm 旧容器(幂等) → run → 健康检查 → 失败 rescue 回滚
+#
+# 隔离性：全部使用 cd_dir 下的自带二进制 am-containerd / am-ctr / shim / runc，
+# 独立 --root/--state/--address/--pid-file/日志，独立进程，不注册 systemd 服务，
+# 不读取系统 /etc/containerd/config.toml，与目标机已有的 docker/containerd 完全互不影响。
+- hosts: all
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python
+  environment:
+    # 自带 shim/runc 优先：containerd 按固定名查找 containerd-shim-runc-v2 与 runc
+    PATH: "<< cd_bin >>:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  vars:
+    image: "<< image >>"
+    cname: "<< cname >>"
+    ns: "<< namespace >>"
+    runtime: "<< runtime >>"
+    hc: << healthcheck | tojson >>
+    old_tag: "<< old_tag >>"
+    do_rollback: "<< do_rollback >>"
+    # 镜像来源：pull = registry 拉取；build = 构建主机 Docker 构建产物导入
+    image_source: "<< image_source >>"
+    tar_path: "<< tar_path >>"
+    # 隔离套件布局（全部为渲染期字面量）
+    cd_dir: "<< cd_dir >>"
+    cd_bin: "<< cd_bin >>"
+    cd_root: "<< cd_root >>"
+    cd_state: "<< cd_state >>"
+    cd_sock: "<< cd_sock >>"
+    cd_pid: "<< cd_pid >>"
+    cd_log: "<< cd_log >>"
+    cd_bundle: "<< cd_bundle >>"
+    cd_ctr: "<< ctr_bin >>"
+    cd_daemon: "<< daemon_bin >>"
+    # 容器挂载源（宿主路径）：运行期需先补建，否则 runc bind mount 失败
+    mount_dirs: << mount_dirs | tojson >>
+    mount_dirs_shell: "<< mount_dirs_shell >>"
+    # 带独立 socket 与命名空间的 ctr/nerdctl 调用前缀
+    ctl: "{{ cd_ctr }} --address {{ cd_sock }} -n {{ ns }}"
+  tasks:
+    - name: 连通性预检
+      ansible.builtin.ping:
+
+    # ---------- 隔离套件分发（自带 containerd/ctr/shim/runc）----------
+    - name: 套件目录准备
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: << cd_dirs | tojson >>
+
+    - name: 分发自带套件（HTTP URL → 下载解压）
+      when: cd_bundle[0:4] == 'http'
+      block:
+        - name: 下载套件包
+          ansible.builtin.get_url:
+            url: "{{ cd_bundle }}"
+            dest: "{{ cd_dir }}/bundle.tgz"
+            mode: "0644"
+          retries: 3
+          delay: 3
+        - name: 解压套件
+          ansible.builtin.unarchive:
+            src: "{{ cd_dir }}/bundle.tgz"
+            dest: "{{ cd_dir }}"
+            remote_src: true
+
+    - name: 分发自带套件（控制端本地路径 → 拷贝解压）
+      when: cd_bundle[0:5] == 'file:'
+      block:
+        - name: 拷贝套件包到目标机
+          ansible.builtin.copy:
+            src: "<< cd_bundle[5:] >>"
+            dest: "{{ cd_dir }}/bundle.tgz"
+            mode: "0644"
+        - name: 解压套件
+          ansible.builtin.unarchive:
+            src: "{{ cd_dir }}/bundle.tgz"
+            dest: "{{ cd_dir }}"
+            remote_src: true
+
+    - name: 套件二进制重命名（与系统 containerd/ctr 彻底区分）
+      when: cd_bundle | length > 0
+      ansible.builtin.shell: |
+        set -e
+        cd "{{ cd_bin }}"
+        # containerd/ctr 改名为 am- 前缀；shim 与 runc 必须保留标准名（containerd 按固定名查找）
+        [ -f containerd ] && mv -f containerd am-containerd || true
+        [ -f ctr ] && mv -f ctr am-ctr || true
+        chmod +x am-containerd am-ctr runc containerd-shim 2>/dev/null || true
+        chmod +x containerd-shim-runc-v1 containerd-shim-runc-v2 2>/dev/null || true
+        ls am-containerd am-ctr >/dev/null
+      args:
+        executable: /bin/bash
+
+    - name: 校验自带二进制就绪
+      ansible.builtin.stat:
+        path: "{{ cd_daemon }}"
+      register: cd_bin_stat
+      failed_when: not cd_bin_stat.stat.exists
+
+    # ---------- 启动隔离 containerd（幂等，不依赖 systemd）----------
+    - name: 检查隔离 containerd 是否存活
+      ansible.builtin.command: "{{ cd_ctr }} --address {{ cd_sock }} version"
+      register: cd_alive
+      failed_when: false
+      changed_when: false
+
+    - name: 启动隔离 containerd 进程
+      when: cd_alive.rc != 0
+      ansible.builtin.shell: |
+        rm -f "{{ cd_sock }}"
+        # 全部用自带二进制：am-containerd / shim / runc 在 cd_bin 下，PATH 优先 cd_bin
+        export PATH="{{ cd_bin }}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        nohup "{{ cd_daemon }}" \
+          --root "{{ cd_root }}" \
+          --state "{{ cd_state }}" \
+          --address "{{ cd_sock }}" \
+          > "{{ cd_log }}" 2>&1 &
+        echo $! > "{{ cd_pid }}"
+      args:
+        executable: /bin/bash
+
+    - name: 等待隔离 containerd socket 就绪
+      ansible.builtin.command: "{{ cd_ctr }} --address {{ cd_sock }} version"
+      register: cd_ready
+      until: cd_ready.rc == 0
+      retries: 15
+      delay: 2
+      changed_when: false
+
+    # ---------- 镜像与容器（全部走自带 am-ctr + 独立 socket/namespace）----------
+    - name: 拉取镜像（registry）
+      when: image_source == 'pull'
+      ansible.builtin.command: >-
+        << cmd_pull >>
+      register: pull_rc
+      retries: 3
+      delay: 5
+      until: pull_rc.rc == 0
+
+    - name: 分发镜像（Docker 构建产物 tar，经控制端中转）
+      when: image_source == 'build'
+      block:
+        - name: 拷贝镜像 tar 到目标机
+          ansible.builtin.copy:
+            # playbook 在 project/ 目录执行，fetch 相对 playbook 目录落于 project/fetched/image.tar
+            src: "fetched/image.tar"
+            dest: "<< tar_path >>"
+            mode: "0644"
+        - name: 导入镜像（自带 ctr/nerdctl，docker save 格式）
+          ansible.builtin.command: >-
+            << cmd_import >>
+          register: pull_rc
+          retries: 3
+          delay: 5
+          until: pull_rc.rc == 0
+        - name: 镜像重命名为平台短名（ctr import 会落成 docker.io/library/<img>）
+          when: runtime == 'ctr'
+          ansible.builtin.shell: |
+            set -e
+            SRC="{{ ctl }} images ls -q | grep '^docker.io/library/{{ image.split(":")[0] }}:{{ image.split(":")[1] }}' | head -1 || true"
+            REF=$(eval "$SRC")
+            if [ -n "$REF" ] && [ "$REF" != "{{ image }}" ]; then
+              {{ ctl }} images tag "$REF" "{{ image }}" 2>/dev/null || true
+            fi
+          args:
+            executable: /bin/bash
+          changed_when: false
+        - name: 清理目标机镜像 tar
+          ansible.builtin.file:
+            path: "<< tar_path >>"
+            state: absent
+
+    - name: 停止并移除旧容器（幂等）
+      ansible.builtin.shell: >-
+        << cmd_rm_old >>
+      failed_when: false
+      changed_when: false
+
+    - name: 准备容器挂载源路径（幂等，仅补建缺失项）
+      when: mount_dirs | length > 0
+      ansible.builtin.shell: |
+        for d in << mount_dirs_shell >>; do
+          [ -e "$d" ] || mkdir -p "$d"
+        done
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: 启动容器
+      ansible.builtin.command: >-
+        << cmd_run >>
+      register: run_rc
+
+    - name: 健康检查
+      block:
+        - name: TCP 端口探测
+          ansible.builtin.wait_for:
+            host: "{{ ansible_host | default(inventory_hostname) }}"
+            port: "{{ hc.port }}"
+            timeout: "{{ hc.delay | default(30) }}"
+          when: hc.type | default('') == 'tcp'
+        - name: HTTP 探测
+          ansible.builtin.uri:
+            url: "http://{{ ansible_host | default(inventory_hostname) }}:{{ hc.port }}{{ hc.path | default('/') }}"
+            status_code: "{{ hc.status_code | default(200) }}"
+          retries: "{{ hc.retries | default(3) }}"
+          delay: "{{ hc.delay | default(5) }}"
+          when: hc.type | default('') == 'http'
+        - name: 命令探测
+          ansible.builtin.command: "{{ hc.cmd }}"
+          retries: "{{ hc.retries | default(3) }}"
+          delay: "{{ hc.delay | default(5) }}"
+          register: hc_rc
+          until: hc_rc.rc == 0
+          when: hc.type | default('') == 'cmd'
+      rescue:
+        - name: 回滚 - 移除新容器
+          ansible.builtin.shell: >-
+            << cmd_rollback_rm >>
+          failed_when: false
+          when: do_rollback | bool
+        - name: 回滚 - 以旧镜像重启
+          ansible.builtin.shell: >-
+            << cmd_rollback_run >>
+          failed_when: false
+          when: do_rollback | bool
+        - name: 标记部署失败
+          ansible.builtin.fail:
+            msg: "健康检查失败，已回滚至 {{ old_tag or '无历史版本' }}"
+          when: do_rollback | bool

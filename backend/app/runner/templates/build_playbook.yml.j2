@@ -1,0 +1,53 @@
+# Docker 构建阶段（构建主机）：docker build → docker save → fetch 回控制端供分发。
+# 与主部署 play 分开：本 play 只跑在构建主机上，构建产物经控制端中转到各目标机，
+# 目标机之间不需要互信 SSH，也不依赖镜像仓库。
+# 定界符约定同 deploy_playbook：平台注入用尖括号，双花括号留给 Ansible 运行期。
+- hosts: "<< build_alias >>"
+  gather_facts: false
+  connection: local
+  vars:
+    build_alias: "<< build_alias >>"
+    image: "<< image >>"
+    tar_path: "<< tar_path >>"
+  tasks:
+    - name: Docker 服务连通性检查
+      ansible.builtin.command: docker version
+      changed_when: false
+      register: docker_ver
+      failed_when: docker_ver.rc != 0
+
+    - name: Docker 构建镜像
+      ansible.builtin.shell: "docker build -t << image >> -f << dockerfile >> << build_args >> << build_context >>"
+      args:
+        executable: /bin/bash
+
+    - name: 导出镜像为 tar（供分发到目标机）
+      ansible.builtin.command: >-
+        docker save -o << tar_path >> << image >>
+
+    # localhost（local connection）时 fetch 是自拷贝，直接跳过（tar 已在控制端本地）
+    - name: 收集镜像 tar 到控制端
+      ansible.builtin.fetch:
+        src: "<< tar_path >>"
+        dest: "fetched/image.tar"
+        flat: true
+      when: build_alias != 'localhost'
+
+    # localhost（local connection）时拷贝 tar 到 ansible 项目目录供 copy 分发
+    - name: 准备 fetched 目录（localhost 构建）
+      ansible.builtin.file:
+        path: "fetched"
+        state: directory
+      when: build_alias == 'localhost'
+
+    - name: 拷贝镜像 tar 到项目目录（localhost 构建时 fetch 被跳过）
+      ansible.builtin.copy:
+        src: "<< tar_path >>"
+        dest: "fetched/image.tar"
+        remote_src: true
+      when: build_alias == 'localhost'
+
+    - name: 清理构建主机上的镜像 tar
+      ansible.builtin.file:
+        path: "<< tar_path >>"
+        state: absent

@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时数据（默认全忽略；仅放开插件 role 源码 + bundle 二进制）
+backend/data/*
+!backend/data/.gitkeep
+!backend/data/plugins/
+backend/data/plugins/*
+# 保留 am_app / am_agent 这两个自带 role 的 YAML 源码
+!backend/data/plugins/roles/
+backend/data/plugins/roles/*
+!backend/data/plugins/roles/am_app/
+!backend/data/plugins/roles/am_agent/
+# bundle 走 git-lfs（.gitattributes 已声明）
+!backend/data/plugins/bundle/
+backend/data/plugins/bundle/*
+!backend/data/plugins/bundle/*.tar
+!backend/data/plugins/bundle/*.tar.gz
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+
+# 环境
+.env
+*.db
+*.sqlite*
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code 本地会话配置
+.claude/
+
+# 后端偶尔混入的 node 依赖（e2e 测试用）
+backend/node_modules/
+
+# 打包产物由 git-lfs 管（见 .gitattributes），但本地 tar/tar.gz 不入普通工作区索引
+# .gitattributes 会把它们交给 LFS
+
+# pytest / 构建缓存
+.pytest_cache/
+backend/.pytest_cache/

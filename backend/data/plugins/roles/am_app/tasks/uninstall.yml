@@ -1,0 +1,68 @@
+# 卸载 am_app：停容器 → 等容器退出 → 停 am-containerd → 删目录
+- name: 停掉 ansible-manager 容器（SIGTERM）
+  ansible.builtin.shell: |
+    CD_DIR="{{ am_cd_dir | default('/opt/am-containerd') }}"
+    CT="{{ am_container | default('ansible-manager') }}"
+    SOCK="$CD_DIR/run/containerd/containerd.sock"
+    [ -x "$CD_DIR/bin/am-ctr" ] || exit 0
+    "$CD_DIR/bin/am-ctr" --address "$SOCK" -n k8s.io tasks kill "$CT" 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  failed_when: false
+  changed_when: true
+
+- name: 等容器任务完全退出（最多等 15 秒，rootfs 卸载后才能删目录）
+  ansible.builtin.shell: |
+    CD_DIR="{{ am_cd_dir | default('/opt/am-containerd') }}"
+    CT="{{ am_container | default('ansible-manager') }}"
+    SOCK="$CD_DIR/run/containerd/containerd.sock"
+    for i in $(seq 1 15); do
+      if ! "$CD_DIR/bin/am-ctr" --address "$SOCK" -n k8s.io tasks list 2>/dev/null | grep -q "^$CT"; then
+        echo "container exited"
+        exit 0
+      fi
+      sleep 1
+    done
+    # 还在跑就强杀
+    "$CD_DIR/bin/am-ctr" --address "$SOCK" -n k8s.io tasks kill --signal KILL "$CT" 2>/dev/null || true
+    sleep 2
+  args:
+    executable: /bin/bash
+  failed_when: false
+  changed_when: true
+
+- name: 删除容器记录与镜像
+  ansible.builtin.shell: |
+    CD_DIR="{{ am_cd_dir | default('/opt/am-containerd') }}"
+    CT="{{ am_container | default('ansible-manager') }}"
+    SOCK="$CD_DIR/run/containerd/containerd.sock"
+    "$CD_DIR/bin/am-ctr" --address "$SOCK" -n k8s.io containers delete "$CT" 2>/dev/null || true
+    "$CD_DIR/bin/am-ctr" --address "$SOCK" -n k8s.io images rm "{{ am_image_ref | default('ansible-manager:local') }}" 2>/dev/null || true
+    "$CD_DIR/bin/am-ctr" --address "$SOCK" -n k8s.io images rm "docker.io/library/{{ am_image_ref | default('ansible-manager:local') }}" 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  failed_when: false
+  changed_when: true
+
+- name: kill am-containerd 进程（用 pid 文件精确杀）
+  ansible.builtin.shell: |
+    CD_DIR="{{ am_cd_dir | default('/opt/am-containerd') }}"
+    if [ -f "$CD_DIR/run/containerd.pid" ]; then
+      PID=$(cat "$CD_DIR/run/containerd.pid" 2>/dev/null || true)
+      [ -n "$PID" ] && kill "$PID" 2>/dev/null || true
+    fi
+    pkill -x am-containerd 2>/dev/null || true
+    sleep 2
+  args:
+    executable: /bin/bash
+  changed_when: true
+  failed_when: false
+
+- name: 删除安装目录
+  ansible.builtin.file:
+    path: "{{ am_cd_dir | default('/opt/am-containerd') }}"
+    state: absent
+
+- name: 回显卸载结果
+  ansible.builtin.debug:
+    msg: "ansible-manager 容器与 am-containerd 已卸载：{{ am_cd_dir | default('/opt/am-containerd') }}"

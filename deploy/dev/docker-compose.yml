@@ -1,0 +1,46 @@
+# 开发/验证环境：3 个 sshd 目标主机 + 后端(SQLite)。用于 E2E 验证主机管理/监控/任务/部署。
+version: "3.8"
+
+services:
+  target1:
+    image: linuxserver/openssh-server:latest
+    container_name: am-target1
+    environment:
+      - USER_NAME=root
+      - PASSWORD_ACCESS=true
+      - USER_PASSWORD=root123
+      - TZ=Asia/Shanghai
+    ports:
+      - "2222:2222"
+    command: bash -c "
+      echo 'root:root123' | chpasswd;
+      sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || true;
+      exec /usr/sbin/sshd -D"
+
+  backend:
+    build:
+      context: ../../backend
+      dockerfile: ../../deploy/backend.Dockerfile
+    container_name: am-dev-backend
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:///./data/ansible_manager.db
+      DEBUG: "true"
+    ports:
+      - "8000:8000"
+    volumes:
+      - dev_backend_data:/app/data
+    depends_on:
+      - target1
+
+  frontend:
+    build:
+      context: ../..
+      dockerfile: deploy/frontend.Dockerfile
+    container_name: am-dev-frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+
+volumes:
+  dev_backend_data:

@@ -1,0 +1,187 @@
+# am_app: 在目标主机上部署 ansible-manager 服务本身。
+#
+# 链路：
+#   1. 分发隔离 am-containerd 套件（am-containerd / am-ctr）到 {{ am_cd_dir }}
+#   2. 启动 am-containerd 独立 daemon（不碰系统 docker/containerd）
+#   3. 拷贝 ansible-manager 镜像 tar → am-ctr import
+#   4. 挂载 {{ am_cd_dir }}/data → 容器 /app/data（SQLite/插件/任务目录持久化）
+#   5. am-ctr run --net-host 起容器，占宿主机 3000 端口
+#
+# 变量（extra_vars 可覆盖，默认从 plugin.config 来）：
+#   am_cd_dir:        安装根目录，默认 /opt/am-containerd
+#   am_bundle_file:   containerd 套件 bundle（控制端本地路径）
+#   am_image_tar:     ansible-manager 镜像 tar（控制端本地路径）
+#   am_image_ref:     镜像名:tag，默认 ansible-manager:local
+#   am_container:     容器名，默认 ansible-manager
+#   am_port:          宿主机端口，默认 3000（--net-host 模式直接占）
+
+- name: 套件目录准备
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ am_cd_dir | default('/opt/am-containerd') }}/bin"
+    - "{{ am_cd_dir | default('/opt/am-containerd') }}/var/lib/containerd"
+    - "{{ am_cd_dir | default('/opt/am-containerd') }}/run/containerd"
+    - "{{ am_cd_dir | default('/opt/am-containerd') }}/data"
+
+- name: 分发 containerd bundle（控制端本地文件）
+  when: (am_bundle_file | default('')) | length > 0
+  block:
+    - name: 拷贝 containerd bundle
+      ansible.builtin.copy:
+        src: "{{ am_bundle_file }}"
+        dest: "{{ am_cd_dir | default('/opt/am-containerd') }}/containerd-bundle.tgz"
+        mode: "0644"
+    - name: 解压 containerd bundle
+      ansible.builtin.unarchive:
+        src: "{{ am_cd_dir | default('/opt/am-containerd') }}/containerd-bundle.tgz"
+        dest: "{{ am_cd_dir | default('/opt/am-containerd') }}/bin"
+        remote_src: true
+
+- name: 重命名二进制为 am- 前缀
+  ansible.builtin.shell: |
+    set -e
+    cd "{{ am_cd_dir | default('/opt/am-containerd') }}/bin"
+    [ -f containerd ] && mv -f containerd am-containerd || true
+    [ -f ctr ] && mv -f ctr am-ctr || true
+    chmod +x am-containerd am-ctr runc containerd-shim containerd-shim-runc-v1 containerd-shim-runc-v2 2>/dev/null || true
+    ls am-containerd am-ctr >/dev/null
+  args:
+    executable: /bin/bash
+
+- name: 检查 am-containerd 是否存活
+  ansible.builtin.command: >-
+    {{ am_cd_dir | default('/opt/am-containerd') }}/bin/am-ctr
+    --address {{ am_cd_dir | default('/opt/am-containerd') }}/run/containerd/containerd.sock version
+  register: am_alive
+  failed_when: false
+  changed_when: false
+
+- name: 启动 am-containerd 进程
+  when: am_alive.rc != 0
+  ansible.builtin.shell: |
+    set -e
+    CD_DIR="{{ am_cd_dir | default('/opt/am-containerd') }}"
+    rm -f "$CD_DIR/run/containerd/containerd.sock"
+    export PATH="$CD_DIR/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    nohup "$CD_DIR/bin/am-containerd" \
+      --root "$CD_DIR/var/lib/containerd" \
+      --state "$CD_DIR/run/containerd" \
+      --address "$CD_DIR/run/containerd/containerd.sock" \
+      > "$CD_DIR/containerd.log" 2>&1 &
+    echo $! > "$CD_DIR/run/containerd.pid"
+  args:
+    executable: /bin/bash
+
+- name: 等待 am-containerd socket 就绪
+  ansible.builtin.command: >-
+    {{ am_cd_dir | default('/opt/am-containerd') }}/bin/am-ctr
+    --address {{ am_cd_dir | default('/opt/am-containerd') }}/run/containerd/containerd.sock version
+  register: am_ready
+  until: am_ready.rc == 0
+  retries: 15
+  delay: 2
+  changed_when: false
+
+- name: 把 am-containerd bin 目录加入全局 PATH（/etc/profile.d/am-containerd.sh）
+  ansible.builtin.copy:
+    dest: /etc/profile.d/am-containerd.sh
+    mode: "0644"
+    content: |
+      # ansible-manager 隔离 containerd 套件（am-containerd / am-ctr）
+      export AM_CONTAINERD_DIR="{{ am_cd_dir | default('/opt/am-containerd') }}"
+      export AM_CONTAINERD_SOCK="{{ am_cd_dir | default('/opt/am-containerd') }}/run/containerd/containerd.sock"
+      # am-ctr 默认连隔离 socket，不必每次敲 --address
+      export CONTAINERD_ADDRESS="{{ am_cd_dir | default('/opt/am-containerd') }}/run/containerd/containerd.sock"
+      export CONTAINERD_NAMESPACE="k8s.io"
+      case ":$PATH:" in
+        *":{{ am_cd_dir | default('/opt/am-containerd') }}/bin:"*) ;;
+        *) export PATH="{{ am_cd_dir | default('/opt/am-containerd') }}/bin:$PATH" ;;
+      esac
+
+- name: 当前 shell 立即生效 PATH（非交互 shell 也能直接用 am-ctr）
+  ansible.builtin.shell: |
+    # 给 /root/.bashrc 也追加一行，避免某些 SSH 非登录场景读不到 /etc/profile.d
+    grep -q 'am-containerd/bin' /root/.bashrc 2>/dev/null || echo 'export PATH="{{ am_cd_dir | default('/opt/am-containerd') }}/bin:$PATH"' >> /root/.bashrc
+  args:
+    executable: /bin/bash
+  changed_when: true
+
+- name: 分发 ansible-manager 镜像 tar
+  when: (am_image_tar | default('')) | length > 0
+  ansible.builtin.copy:
+    src: "{{ am_image_tar }}"
+    dest: "{{ am_cd_dir | default('/opt/am-containerd') }}/ansible-manager.tar"
+    mode: "0644"
+
+- name: 导入 ansible-manager 镜像到 am-containerd
+  when: (am_image_tar | default('')) | length > 0
+  ansible.builtin.command: >-
+    {{ am_cd_dir | default('/opt/am-containerd') }}/bin/am-ctr
+    --address {{ am_cd_dir | default('/opt/am-containerd') }}/run/containerd/containerd.sock
+    -n k8s.io images import "{{ am_cd_dir | default('/opt/am-containerd') }}/ansible-manager.tar"
+
+- name: 给镜像补一个短名 tag（docker save 导入后落成 docker.io/library/<name>）
+  when: (am_image_tar | default('')) | length > 0
+  ansible.builtin.shell: |
+    set -e
+    CD_DIR="{{ am_cd_dir | default('/opt/am-containerd') }}"
+    SHORT="{{ am_image_ref | default('ansible-manager:local') }}"
+    SRC="docker.io/library/{{ am_image_ref | default('ansible-manager:local') }}"
+    # 先删旧短名，否则 am-ctr images tag 不会覆盖已有 tag
+    "$CD_DIR/bin/am-ctr" --address "$CD_DIR/run/containerd/containerd.sock" -n k8s.io images rm "$SHORT" 2>/dev/null || true
+    "$CD_DIR/bin/am-ctr" --address "$CD_DIR/run/containerd/containerd.sock" -n k8s.io images tag "$SRC" "$SHORT"
+  args:
+    executable: /bin/bash
+
+- name: 检查容器是否已存在
+  ansible.builtin.command: >-
+    {{ am_cd_dir | default('/opt/am-containerd') }}/bin/am-ctr
+    --address {{ am_cd_dir | default('/opt/am-containerd') }}/run/containerd/containerd.sock
+    -n k8s.io containers list -q
+  register: existing_containers
+  changed_when: false
+
+- name: 停掉旧的 ansible-manager 容器（幂等；不动镜像，镜像由 import/tag 步骤保证最新）
+  ansible.builtin.shell: |
+    set -e
+    CD_DIR="{{ am_cd_dir | default('/opt/am-containerd') }}"
+    CT="{{ am_container | default('ansible-manager') }}"
+    SOCK="$CD_DIR/run/containerd/containerd.sock"
+    "$CD_DIR/bin/am-ctr" --address "$SOCK" -n k8s.io tasks kill "$CT" 2>/dev/null || true
+    "$CD_DIR/bin/am-ctr" --address "$SOCK" -n k8s.io containers delete "$CT" 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  failed_when: false
+  changed_when: true
+
+- name: 启动 ansible-manager 容器（--net-host 占宿主机 3000）
+  ansible.builtin.command: >-
+    {{ am_cd_dir | default('/opt/am-containerd') }}/bin/am-ctr
+    --address {{ am_cd_dir | default('/opt/am-containerd') }}/run/containerd/containerd.sock
+    -n k8s.io run
+    --net-host
+    --mount type=bind,src={{ am_cd_dir | default('/opt/am-containerd') }}/data,dst=/app/data,options=rbind:rw
+    --env APP_PORT={{ am_port | default(3000) }}
+    --env TZ=Asia/Shanghai
+    -d
+    "{{ am_image_ref | default('ansible-manager:local') }}"
+    "{{ am_container | default('ansible-manager') }}"
+
+- name: 等待服务就绪（HTTP 探测）
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ am_port | default(3000) }}/api/v1/healthz"
+    status_code: [200, 404]
+  register: health
+  until: health.status in [200, 404]
+  retries: 20
+  delay: 3
+
+- name: 回显部署结果
+  ansible.builtin.debug:
+    msg: >-
+      ansible-manager 已在 {{ inventory_hostname }} 上运行：
+      容器={{ am_container | default('ansible-manager') }} 镜像={{ am_image_ref | default('ansible-manager:local') }}
+      端口={{ am_port | default(3000) }} data={{ am_cd_dir | default('/opt/am-containerd') }}/data

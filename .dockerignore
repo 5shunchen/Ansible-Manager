@@ -1,0 +1,15 @@
+# 构建上下文排除（镜像内自行构建前端；数据与密钥不入镜像）
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.mypy_cache
+backend/data
+backend/.env
+backend/.venv
+frontend/node_modules
+frontend/dist
+deploy/dev
+*.log
+*.tgz
